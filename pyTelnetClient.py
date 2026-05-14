@@ -6,6 +6,8 @@ Run:  python pyTelnetClient.py
 
 The escape-code semantics mirror the vZ80 console parser so the same
 mode switch ("vt100" | "adm3a") behaves identically on either end.
+
+Dean Gienger, May 13, 2026, with Claude
 """
 
 import socket
