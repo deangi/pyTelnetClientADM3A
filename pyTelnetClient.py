@@ -7,14 +7,82 @@ Run:  python pyTelnetClient.py
 The escape-code semantics mirror the vZ80 console parser so the same
 mode switch ("vt100" | "adm3a") behaves identically on either end.
 
+Version 2.0, June 24, 2026
 Dean Gienger, May 13, 2026, with Claude
 """
 
 import socket
 import threading
 import queue
+import json
+import os
 import tkinter as tk
-from tkinter import ttk, font
+from pathlib import Path
+from tkinter import ttk, font, messagebox
+
+APP_VERSION = "2.0"
+APP_RELEASE_DATE = "June 24, 2026"
+APP_CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "pyTelnetClient"
+CONNECTIONS_FILE = APP_CONFIG_DIR / "connections.json"
+
+EMULATION_TYPES = ("VT-100", "ADM-3A")
+
+
+class ConnectionStore:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            return []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        if not isinstance(raw, list):
+            return []
+
+        connections = []
+        for item in raw:
+            normalized = self._normalize(item)
+            if normalized is not None:
+                connections.append(normalized)
+        return connections
+
+    def save(self, connections):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8") as f:
+            json.dump(connections, f, indent=2)
+            f.write("\n")
+
+    def _normalize(self, item):
+        if not isinstance(item, dict):
+            return None
+
+        name = str(item.get("name", "")).strip()
+        host = str(item.get("host", "")).strip()
+        mode = str(item.get("emulation", "VT-100")).strip().upper()
+        try:
+            port = int(item.get("port", 23))
+        except (TypeError, ValueError):
+            port = 23
+
+        if not name or not host:
+            return None
+
+        if mode in ("ADM3A", "ADM-3A"):
+            emulation = "ADM-3A"
+        else:
+            emulation = "VT-100"
+
+        return {
+            "name": name,
+            "host": host,
+            "port": port,
+            "emulation": emulation,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -33,9 +101,49 @@ class TerminalEmulator:
     PS_CSI         = 2
     PS_ADM_CUP_ROW = 3   # saw ESC '='; next byte = row + 0x20
     PS_ADM_CUP_COL = 4   # saw row byte; next byte = col + 0x20
+    PS_CHARSET_DESIGNATE = 5  # saw ESC '(' or ESC ')'; next byte names set
+
+    CHARSET_ASCII = "B"
+    CHARSET_SPECIAL_GRAPHICS = "0"
+
+    VT100_SPECIAL_GRAPHICS = {
+        0x5F: ' ',
+        0x60: '◆',
+        0x61: '▒',
+        0x62: '␉',
+        0x63: '␌',
+        0x64: '␍',
+        0x65: '␊',
+        0x66: '°',
+        0x67: '±',
+        0x68: '␤',
+        0x69: '␋',
+        0x6A: '┘',
+        0x6B: '┐',
+        0x6C: '┌',
+        0x6D: '└',
+        0x6E: '┼',
+        0x6F: '⎺',
+        0x70: '⎻',
+        0x71: '─',
+        0x72: '⎼',
+        0x73: '⎽',
+        0x74: '├',
+        0x75: '┤',
+        0x76: '┴',
+        0x77: '┬',
+        0x78: '│',
+        0x79: '≤',
+        0x7A: '≥',
+        0x7B: 'π',
+        0x7C: '≠',
+        0x7D: '£',
+        0x7E: '·',
+    }
 
     def __init__(self):
         self.buf = [[' '] * self.COLS for _ in range(self.ROWS)]
+        self.inverse = [[False] * self.COLS for _ in range(self.ROWS)]
         self.cx = 0
         self.cy = 0
         self.saved_cx = 0
@@ -44,18 +152,32 @@ class TerminalEmulator:
         self.pstate = self.PS_GROUND
         self.params = []
         self.cur_param = ''
+        self.csi_private = False
         self.adm_cup_row = 0
+        self.charset_designate_target = 0
+        self.g0_charset = self.CHARSET_ASCII
+        self.g1_charset = self.CHARSET_ASCII
+        self.active_charset = 0
+        self.vt100_application_keypad = False
+        self.vt100_cursor_key_application = False
+        self.vt100_auto_wrap = False
+        self.current_inverse = False
         self.dirty = True
 
     # ---- mode --------------------------------------------------------------
     def set_mode(self, mode):
         self.mode = mode
+        self.pstate = self.PS_GROUND
+        if mode == self.MODE_VT100:
+            self.vt100_application_keypad = False
+            self.active_charset = 0
 
     # ---- low-level buffer ops ---------------------------------------------
     def clear(self):
         for r in range(self.ROWS):
             for c in range(self.COLS):
                 self.buf[r][c] = ' '
+                self.inverse[r][c] = False
         self.cx = 0
         self.cy = 0
         self.dirty = True
@@ -63,7 +185,9 @@ class TerminalEmulator:
     def scroll_up(self):
         for r in range(self.ROWS - 1):
             self.buf[r] = self.buf[r + 1][:]
+            self.inverse[r] = self.inverse[r + 1][:]
         self.buf[self.ROWS - 1] = [' '] * self.COLS
+        self.inverse[self.ROWS - 1] = [False] * self.COLS
         self.dirty = True
 
     def newline(self):
@@ -84,12 +208,15 @@ class TerminalEmulator:
         if mode == 0:
             for c in range(self.cx, self.COLS):
                 self.buf[self.cy][c] = ' '
+                self.inverse[self.cy][c] = False
         elif mode == 1:
             for c in range(0, self.cx + 1):
                 self.buf[self.cy][c] = ' '
+                self.inverse[self.cy][c] = False
         elif mode == 2:
             for c in range(self.COLS):
                 self.buf[self.cy][c] = ' '
+                self.inverse[self.cy][c] = False
         self.dirty = True
 
     def erase_in_display(self, mode):
@@ -97,19 +224,24 @@ class TerminalEmulator:
         if mode == 0:
             for c in range(self.cx, self.COLS):
                 self.buf[self.cy][c] = ' '
+                self.inverse[self.cy][c] = False
             for r in range(self.cy + 1, self.ROWS):
                 for c in range(self.COLS):
                     self.buf[r][c] = ' '
+                    self.inverse[r][c] = False
         elif mode == 1:
             for r in range(0, self.cy):
                 for c in range(self.COLS):
                     self.buf[r][c] = ' '
+                    self.inverse[r][c] = False
             for c in range(0, self.cx + 1):
                 self.buf[self.cy][c] = ' '
+                self.inverse[self.cy][c] = False
         elif mode == 2:
             for r in range(self.ROWS):
                 for c in range(self.COLS):
                     self.buf[r][c] = ' '
+                    self.inverse[r][c] = False
         self.dirty = True
 
     # ---- byte stream entrypoint -------------------------------------------
@@ -139,6 +271,10 @@ class TerminalEmulator:
         if self.pstate == self.PS_ADM_CUP_COL:
             col = b - 0x20
             self.cursor_to(self.adm_cup_row, col)
+            self.pstate = self.PS_GROUND
+            return
+        if self.pstate == self.PS_CHARSET_DESIGNATE:
+            self.designate_charset(b)
             self.pstate = self.PS_GROUND
             return
 
@@ -176,6 +312,14 @@ class TerminalEmulator:
         if b == 0x0D:                                   # CR
             self.cx = 0
             return
+        if b == 0x0E:                                   # SO — invoke G1
+            if self.mode == self.MODE_VT100:
+                self.active_charset = 1
+            return
+        if b == 0x0F:                                   # SI — invoke G0
+            if self.mode == self.MODE_VT100:
+                self.active_charset = 0
+            return
         if b == 0x0B:                                   # VT — ADM cursor up; VT-100 ignores
             if self.mode == self.MODE_ADM3A and self.cy > 0:
                 self.cy -= 1
@@ -194,18 +338,37 @@ class TerminalEmulator:
 
         # Printable
         if 0x20 <= b < 0x7F:
-            self.buf[self.cy][self.cx] = chr(b)
+            self.buf[self.cy][self.cx] = self.translate_printable(b)
+            self.inverse[self.cy][self.cx] = self.current_inverse
             self.dirty = True
             if self.cx < self.COLS - 1:
                 self.cx += 1
+            elif self.mode == self.MODE_VT100 and self.vt100_auto_wrap:
+                self.cx = 0
+                if self.cy >= self.ROWS - 1:
+                    self.scroll_up()
+                else:
+                    self.cy += 1
             # else: stay clamped at COLS-1, matching CP/M-friendly behavior
 
     # ---- escape parsing ---------------------------------------------------
     def parse_esc(self, b):
-        # ADM-3A keys — always available regardless of mode
+        # ESC '=' is ADM-3A cursor addressing in ADM-3A mode, and VT100
+        # application keypad mode in VT100 mode.
         if b == ord('='):
-            self.pstate = self.PS_ADM_CUP_ROW
+            if self.mode == self.MODE_ADM3A:
+                self.pstate = self.PS_ADM_CUP_ROW
+            else:
+                self.vt100_application_keypad = True
+                self.pstate = self.PS_GROUND
             return
+
+        if self.mode == self.MODE_VT100 and b == ord('>'):
+            self.vt100_application_keypad = False
+            self.pstate = self.PS_GROUND
+            return
+
+        # ADM-3A screen controls are available regardless of mode
         if b == ord('T'):
             self.erase_in_line(0)
             self.pstate = self.PS_GROUND
@@ -224,6 +387,11 @@ class TerminalEmulator:
             self.pstate = self.PS_CSI
             self.params = []
             self.cur_param = ''
+            self.csi_private = False
+            return
+        if b in (ord('('), ord(')')):
+            self.charset_designate_target = 0 if b == ord('(') else 1
+            self.pstate = self.PS_CHARSET_DESIGNATE
             return
         if b == ord('E'):                                # NEL
             self.newline()
@@ -255,7 +423,32 @@ class TerminalEmulator:
         # Unknown — drop and resume
         self.pstate = self.PS_GROUND
 
+    def designate_charset(self, b):
+        charset = chr(b)
+        if charset not in (self.CHARSET_ASCII, self.CHARSET_SPECIAL_GRAPHICS):
+            charset = self.CHARSET_ASCII
+
+        if self.charset_designate_target == 0:
+            self.g0_charset = charset
+        else:
+            self.g1_charset = charset
+            # Some hosts designate G1 with ESC ) 0 / ESC ) B but omit SO/SI.
+            # Follow the designation so line drawing does not leak as qqq/x.
+            self.active_charset = 1 if charset == self.CHARSET_SPECIAL_GRAPHICS else 0
+
+    def translate_printable(self, b):
+        if self.mode != self.MODE_VT100:
+            return chr(b)
+
+        charset = self.g1_charset if self.active_charset else self.g0_charset
+        if charset == self.CHARSET_SPECIAL_GRAPHICS:
+            return self.VT100_SPECIAL_GRAPHICS.get(b, chr(b))
+        return chr(b)
+
     def parse_csi(self, b):
+        if b == ord('?') and not self.params and self.cur_param == '':
+            self.csi_private = True
+            return
         if 0x30 <= b <= 0x39:                            # digit
             self.cur_param += chr(b)
             return
@@ -269,11 +462,16 @@ class TerminalEmulator:
             if self.cur_param != '':
                 self.params.append(int(self.cur_param))
                 self.cur_param = ''
-            self.dispatch_csi(b)
+            if self.csi_private:
+                self.dispatch_private_csi(b)
+            else:
+                self.dispatch_csi(b)
             self.pstate = self.PS_GROUND
+            self.csi_private = False
             return
         # Anything else — abandon
         self.pstate = self.PS_GROUND
+        self.csi_private = False
 
     def csi_param(self, i, default_val):
         if i < len(self.params):
@@ -316,7 +514,37 @@ class TerminalEmulator:
         elif final == ord('u'):                          # restore cursor
             self.cx = self.saved_cx
             self.cy = self.saved_cy
-        # Other CSI (SGR, DSR, etc.) silently ignored.
+        elif final == ord('m'):                          # SGR
+            self.dispatch_sgr()
+        # Other CSI (DSR, etc.) silently ignored.
+
+    def dispatch_sgr(self):
+        params = self.params if self.params else [0]
+        for param in params:
+            if param == 0:
+                self.current_inverse = False
+            elif param == 7:
+                self.current_inverse = True
+            elif param == 27:
+                self.current_inverse = False
+
+    def dispatch_private_csi(self, final):
+        if final not in (ord('h'), ord('l')):
+            return
+
+        enabled = final == ord('h')
+        for mode in self.params:
+            if mode == 1:                                # DECCKM
+                self.vt100_cursor_key_application = enabled
+            elif mode == 7:                              # DECAWM
+                self.vt100_auto_wrap = enabled
+            elif mode == 8:                              # DECARM
+                # Repeat-key mode is owned by the local keyboard/OS.
+                pass
+            elif mode == 25:                             # DECTCEM
+                # Cursor visibility is ignored; cursor stays visible.
+                pass
+            # Other DEC private modes are safely ignored.
 
     # ---- hooks (overridable) ----------------------------------------------
     def root_bell(self):
@@ -340,10 +568,12 @@ class TelnetClient:
     OPT_ECHO   = 1
     OPT_SGA    = 3
 
-    def __init__(self, rx_callback, status_callback):
+    def __init__(self, rx_callback, status_callback,
+                 unexpected_disconnect_callback=None):
         self.sock = None
         self.rx_callback = rx_callback
         self.status_callback = status_callback
+        self.unexpected_disconnect_callback = unexpected_disconnect_callback
         self.rx_thread = None
         self.running = False
 
@@ -363,7 +593,7 @@ class TelnetClient:
             self.sock = None
             return False
 
-    def disconnect(self):
+    def disconnect(self, unexpected=False):
         was_running = self.running
         self.running = False
         if self.sock is not None:
@@ -378,6 +608,8 @@ class TelnetClient:
             self.sock = None
         if was_running:
             self.status_callback("Disconnected")
+        if unexpected and self.unexpected_disconnect_callback is not None:
+            self.unexpected_disconnect_callback()
 
     def send(self, data):
         if self.sock is None or not self.running:
@@ -388,7 +620,7 @@ class TelnetClient:
             self.sock.sendall(data)
         except Exception as e:
             self.status_callback(f"Send error: {e}")
-            self.disconnect()
+            self.disconnect(unexpected=True)
 
     def _rx_loop(self):
         iac_state = None
@@ -435,6 +667,7 @@ class TelnetClient:
             if out:
                 self.rx_callback(bytes(out))
 
+        unexpected = self.running
         self.running = False
         if self.sock is not None:
             try:
@@ -442,7 +675,10 @@ class TelnetClient:
             except Exception:
                 pass
             self.sock = None
-        self.status_callback("Disconnected")
+        if unexpected:
+            self.status_callback("TCP disconnected")
+            if self.unexpected_disconnect_callback is not None:
+                self.unexpected_disconnect_callback()
 
     def _respond_iac(self, cmd, opt):
         if self.sock is None:
@@ -474,12 +710,19 @@ class TerminalApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("pyTelnetClient — VT-100 / ADM-3A")
+        self.root.title(f"pyTelnetClient v{APP_VERSION} - VT-100 / ADM-3A")
 
         self.term = TerminalEmulator()
         self.term.root_bell = self._bell
         self.rx_queue = queue.Queue()
-        self.telnet = TelnetClient(self._on_rx_bytes, self._on_status)
+        self.telnet = TelnetClient(self._on_rx_bytes, self._on_status,
+                                   self._on_unexpected_disconnect)
+        self.connection_store = ConnectionStore(CONNECTIONS_FILE)
+        self.connections = self.connection_store.load()
+        self.reconnect_after_id = None
+        self.reconnect_active = False
+        self.reconnect_host = ""
+        self.reconnect_port = 23
 
         self._build_ui()
         self._schedule_refresh()
@@ -491,6 +734,17 @@ class TerminalApp:
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=4)
         top.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(top, text="Connection:").pack(side=tk.LEFT)
+        self.connection_var = tk.StringVar()
+        self.connection_combo = ttk.Combobox(top, textvariable=self.connection_var,
+                                             width=18, state="readonly")
+        self.connection_combo.pack(side=tk.LEFT, padx=2)
+        self.connection_combo.bind("<<ComboboxSelected>>",
+                                   self._on_connection_selected)
+
+        ttk.Button(top, text="Manage", command=self._open_connection_manager)\
+            .pack(side=tk.LEFT, padx=(2, 8))
 
         ttk.Label(top, text="Host:").pack(side=tk.LEFT)
         self.host_var = tk.StringVar(value="127.0.0.1")
@@ -517,6 +771,14 @@ class TerminalApp:
         ttk.Button(top, text="Clear", command=self._on_clear)\
             .pack(side=tk.LEFT, padx=2)
 
+        self.connection_state_var = tk.StringVar(value="Disconnected")
+        self.connection_state_label = tk.Label(
+            top, textvariable=self.connection_state_var,
+            bg="#7A1E1E", fg="#FFFFFF", padx=8, pady=2)
+        self.connection_state_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        self._refresh_connection_combo()
+
         # Pick a monospace font that exists
         available = set(font.families())
         for fam in ("Consolas", "Courier New", "Courier", "DejaVu Sans Mono",
@@ -542,14 +804,21 @@ class TerminalApp:
                                 takefocus=True)
         self.canvas.pack(padx=4, pady=4)
 
-        # Pre-build text items per cell — updating items is far cheaper
-        # than redrawing the whole canvas each frame.
+        # Pre-build cell background and text items — updating items is far
+        # cheaper than redrawing the whole canvas each frame.
+        self.cell_bg_items = [[None] * TerminalEmulator.COLS
+                              for _ in range(TerminalEmulator.ROWS)]
         self.cell_items = [[None] * TerminalEmulator.COLS
                            for _ in range(TerminalEmulator.ROWS)]
         for r in range(TerminalEmulator.ROWS):
             for c in range(TerminalEmulator.COLS):
+                x0 = c * self.cell_w
+                y0 = r * self.cell_h
                 x = c * self.cell_w + self.cell_w // 2
                 y = r * self.cell_h + self.cell_h // 2
+                self.cell_bg_items[r][c] = self.canvas.create_rectangle(
+                    x0, y0, x0 + self.cell_w, y0 + self.cell_h,
+                    fill=self.bg, outline=self.bg)
                 self.cell_items[r][c] = self.canvas.create_text(
                     x, y, text=' ', font=self.mono, fill=self.fg,
                     anchor='center')
@@ -581,10 +850,226 @@ class TerminalApp:
         else:
             self.term.set_mode(TerminalEmulator.MODE_VT100)
 
+    def _refresh_connection_combo(self):
+        names = [conn["name"] for conn in self.connections]
+        current = self.connection_var.get()
+        self.connection_combo.configure(values=names)
+        if current not in names:
+            self.connection_var.set("")
+
+    def _on_connection_selected(self, event=None):
+        selected = self.connection_var.get()
+        conn = self._find_connection(selected)
+        if conn is None:
+            return
+
+        self.host_var.set(conn["host"])
+        self.port_var.set(str(conn["port"]))
+        self.mode_var.set(conn["emulation"])
+        self._on_mode_change()
+
+    def _find_connection(self, name):
+        for conn in self.connections:
+            if conn["name"] == name:
+                return conn
+        return None
+
+    def _open_connection_manager(self):
+        win = tk.Toplevel(self.root)
+        win.title("Manage Connections")
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+
+        outer = ttk.Frame(win, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        tree = ttk.Treeview(outer, columns=("host", "port", "emulation"),
+                            show="tree headings", height=8)
+        tree.heading("#0", text="Name")
+        tree.heading("host", text="IP / Host")
+        tree.heading("port", text="Port")
+        tree.heading("emulation", text="Emulation")
+        tree.column("#0", width=130, stretch=False)
+        tree.column("host", width=150, stretch=False)
+        tree.column("port", width=60, anchor=tk.CENTER, stretch=False)
+        tree.column("emulation", width=80, anchor=tk.CENTER, stretch=False)
+        tree.grid(row=0, column=0, columnspan=4, sticky="nsew")
+
+        form = ttk.Frame(outer)
+        form.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+
+        ttk.Label(form, text="Name:").grid(row=0, column=0, sticky=tk.W)
+        name_var = tk.StringVar()
+        ttk.Entry(form, textvariable=name_var, width=22)\
+            .grid(row=0, column=1, padx=(2, 10), sticky=tk.W)
+
+        ttk.Label(form, text="IP / Host:").grid(row=0, column=2, sticky=tk.W)
+        host_var = tk.StringVar()
+        ttk.Entry(form, textvariable=host_var, width=24)\
+            .grid(row=0, column=3, padx=(2, 0), sticky=tk.W)
+
+        ttk.Label(form, text="Port:").grid(row=1, column=0, sticky=tk.W,
+                                           pady=(6, 0))
+        port_var = tk.StringVar(value="23")
+        ttk.Entry(form, textvariable=port_var, width=8)\
+            .grid(row=1, column=1, padx=(2, 10), pady=(6, 0), sticky=tk.W)
+
+        ttk.Label(form, text="Emulation:").grid(row=1, column=2, sticky=tk.W,
+                                                pady=(6, 0))
+        emulation_var = tk.StringVar(value="VT-100")
+        ttk.Combobox(form, textvariable=emulation_var, values=EMULATION_TYPES,
+                     width=10, state="readonly")\
+            .grid(row=1, column=3, padx=(2, 0), pady=(6, 0), sticky=tk.W)
+
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+
+        def refresh_tree(select_name=None):
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            selected_id = None
+            for index, conn in enumerate(self.connections):
+                item_id = str(index)
+                tree.insert("", tk.END, iid=item_id, text=conn["name"],
+                            values=(conn["host"], conn["port"],
+                                    conn["emulation"]))
+                if conn["name"] == select_name:
+                    selected_id = item_id
+            if selected_id is not None:
+                tree.selection_set(selected_id)
+                tree.focus(selected_id)
+
+        def selected_index():
+            selection = tree.selection()
+            if not selection:
+                return None
+            try:
+                return int(selection[0])
+            except ValueError:
+                return None
+
+        def load_selected(event=None):
+            index = selected_index()
+            if index is None or index >= len(self.connections):
+                return
+            conn = self.connections[index]
+            name_var.set(conn["name"])
+            host_var.set(conn["host"])
+            port_var.set(str(conn["port"]))
+            emulation_var.set(conn["emulation"])
+
+        def read_form(existing_index=None):
+            name = name_var.get().strip()
+            host = host_var.get().strip()
+            emulation = emulation_var.get()
+
+            if not name:
+                messagebox.showerror("Connection", "Enter a connection name.",
+                                     parent=win)
+                return None
+            if not host:
+                messagebox.showerror("Connection", "Enter an IP or host.",
+                                     parent=win)
+                return None
+            try:
+                port = int(port_var.get())
+            except ValueError:
+                messagebox.showerror("Connection", "Enter a numeric port.",
+                                     parent=win)
+                return None
+            if port < 1 or port > 65535:
+                messagebox.showerror("Connection",
+                                     "Port must be between 1 and 65535.",
+                                     parent=win)
+                return None
+            if emulation not in EMULATION_TYPES:
+                emulation = "VT-100"
+
+            for index, conn in enumerate(self.connections):
+                if index != existing_index and conn["name"] == name:
+                    messagebox.showerror("Connection",
+                                         "That connection name already exists.",
+                                         parent=win)
+                    return None
+
+            return {
+                "name": name,
+                "host": host,
+                "port": port,
+                "emulation": emulation,
+            }
+
+        def save_connections(select_name=None):
+            self.connection_store.save(self.connections)
+            self._refresh_connection_combo()
+            refresh_tree(select_name)
+
+        def add_connection():
+            conn = read_form()
+            if conn is None:
+                return
+            self.connections.append(conn)
+            save_connections(conn["name"])
+
+        def update_connection():
+            index = selected_index()
+            if index is None or index >= len(self.connections):
+                messagebox.showerror("Connection",
+                                     "Select a connection to update.",
+                                     parent=win)
+                return
+            conn = read_form(index)
+            if conn is None:
+                return
+            self.connections[index] = conn
+            save_connections(conn["name"])
+
+        def delete_connection():
+            index = selected_index()
+            if index is None or index >= len(self.connections):
+                messagebox.showerror("Connection",
+                                     "Select a connection to delete.",
+                                     parent=win)
+                return
+            name = self.connections[index]["name"]
+            if not messagebox.askyesno("Delete Connection",
+                                       f"Delete connection '{name}'?",
+                                       parent=win):
+                return
+            del self.connections[index]
+            save_connections()
+
+        def use_selected():
+            load_selected()
+            selected = selected_index()
+            if selected is None or selected >= len(self.connections):
+                return
+            conn = self.connections[selected]
+            self.connection_var.set(conn["name"])
+            self._on_connection_selected()
+            win.destroy()
+
+        ttk.Button(buttons, text="Add", command=add_connection)\
+            .pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(buttons, text="Update", command=update_connection)\
+            .pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Delete", command=delete_connection)\
+            .pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Use Selected", command=use_selected)\
+            .pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(buttons, text="Close", command=win.destroy)\
+            .pack(side=tk.RIGHT, padx=4)
+
+        tree.bind("<<TreeviewSelect>>", load_selected)
+        refresh_tree()
+
     def _on_connect(self):
         if self.telnet.running:
+            self._cancel_reconnect()
             self.telnet.disconnect()
             self.connect_btn.config(text="Connect")
+            self._set_connection_state("Disconnected", "#7A1E1E")
             return
         try:
             port = int(self.port_var.get())
@@ -596,9 +1081,16 @@ class TerminalApp:
         if not host:
             self.status_var.set("Enter a host")
             return
+        self._cancel_reconnect()
+        self.reconnect_host = host
+        self.reconnect_port = port
+        self._set_connection_state("Connecting", "#7A5A1E")
         if self.telnet.connect(host, port):
             self.connect_btn.config(text="Disconnect")
+            self._set_connection_state("Connected", "#1E6B35")
             self.canvas.focus_set()
+        else:
+            self._set_connection_state("Disconnected", "#7A1E1E")
 
     def _on_clear(self):
         self.term.clear()
@@ -615,7 +1107,56 @@ class TerminalApp:
                 self.connect_btn.config(text="Connect")
         self.root.after(0, apply)
 
+    def _set_connection_state(self, text, bg):
+        self.connection_state_var.set(text)
+        self.connection_state_label.config(bg=bg)
+
+    def _on_unexpected_disconnect(self):
+        self.root.after(0, self._handle_unexpected_disconnect)
+
+    def _handle_unexpected_disconnect(self):
+        self.connect_btn.config(text="Connect")
+        self._set_connection_state("Disconnected - retrying", "#7A1E1E")
+        self.reconnect_active = True
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self):
+        if self.reconnect_after_id is not None:
+            return
+        if not self.reconnect_active or self.telnet.running:
+            return
+        self.reconnect_after_id = self.root.after(4000, self._try_reconnect)
+
+    def _try_reconnect(self):
+        self.reconnect_after_id = None
+        if not self.reconnect_active or self.telnet.running:
+            return
+        if not self.reconnect_host:
+            self._set_connection_state("Disconnected", "#7A1E1E")
+            self.reconnect_active = False
+            return
+
+        self._set_connection_state("Reconnecting", "#7A5A1E")
+        self.status_var.set(
+            f"Reconnecting to {self.reconnect_host}:{self.reconnect_port}")
+        self._on_mode_change()
+        if self.telnet.connect(self.reconnect_host, self.reconnect_port):
+            self.reconnect_active = False
+            self.connect_btn.config(text="Disconnect")
+            self._set_connection_state("Connected", "#1E6B35")
+            self.canvas.focus_set()
+        else:
+            self._set_connection_state("Disconnected - retrying", "#7A1E1E")
+            self._schedule_reconnect()
+
+    def _cancel_reconnect(self):
+        self.reconnect_active = False
+        if self.reconnect_after_id is not None:
+            self.root.after_cancel(self.reconnect_after_id)
+            self.reconnect_after_id = None
+
     def _on_close(self):
+        self._cancel_reconnect()
         self.telnet.disconnect()
         self.root.destroy()
 
@@ -641,12 +1182,23 @@ class TerminalApp:
     def _redraw(self):
         cfg = self.canvas.itemconfig
         items = self.cell_items
+        bg_items = self.cell_bg_items
         buf = self.term.buf
+        inverse = self.term.inverse
         for r in range(TerminalEmulator.ROWS):
             row = buf[r]
+            inverse_row = inverse[r]
             row_items = items[r]
+            row_bg_items = bg_items[r]
             for c in range(TerminalEmulator.COLS):
-                cfg(row_items[c], text=row[c])
+                if inverse_row[c]:
+                    text_fill = self.bg
+                    bg_fill = self.fg
+                else:
+                    text_fill = self.fg
+                    bg_fill = self.bg
+                cfg(row_bg_items[c], fill=bg_fill, outline=bg_fill)
+                cfg(row_items[c], text=row[c], fill=text_fill)
 
     def _update_cursor(self):
         x = self.term.cx * self.cell_w
@@ -682,11 +1234,22 @@ class TerminalApp:
                 'Escape':    b'\x1B',
             }
         else:
+            if self.term.vt100_cursor_key_application:
+                arrow_up = b'\x1BOA'
+                arrow_down = b'\x1BOB'
+                arrow_right = b'\x1BOC'
+                arrow_left = b'\x1BOD'
+            else:
+                arrow_up = b'\x1B[A'
+                arrow_down = b'\x1B[B'
+                arrow_right = b'\x1B[C'
+                arrow_left = b'\x1B[D'
+
             key_map = {
-                'Left':      b'\x1B[D',
-                'Down':      b'\x1B[B',
-                'Up':        b'\x1B[A',
-                'Right':     b'\x1B[C',
+                'Left':      arrow_left,
+                'Down':      arrow_down,
+                'Up':        arrow_up,
+                'Right':     arrow_right,
                 'Home':      b'\x1B[H',
                 'End':       b'\x1B[F',
                 'Prior':     b'\x1B[5~',   # PgUp
@@ -701,6 +1264,49 @@ class TerminalApp:
                 'F3':        b'\x1BOR',
                 'F4':        b'\x1BOS',
             }
+
+            keypad_normal = {
+                'KP_0':        b'0',
+                'KP_1':        b'1',
+                'KP_2':        b'2',
+                'KP_3':        b'3',
+                'KP_4':        b'4',
+                'KP_5':        b'5',
+                'KP_6':        b'6',
+                'KP_7':        b'7',
+                'KP_8':        b'8',
+                'KP_9':        b'9',
+                'KP_Decimal':  b'.',
+                'KP_Subtract': b'-',
+                'KP_Enter':    b'\x0D',
+                'KP_Add':      b'+',
+                'KP_Multiply': b'*',
+                'KP_Divide':   b'/',
+            }
+
+            keypad_application = {
+                'KP_0':        b'\x1BOp',
+                'KP_1':        b'\x1BOq',
+                'KP_2':        b'\x1BOr',
+                'KP_3':        b'\x1BOs',
+                'KP_4':        b'\x1BOt',
+                'KP_5':        b'\x1BOu',
+                'KP_6':        b'\x1BOv',
+                'KP_7':        b'\x1BOw',
+                'KP_8':        b'\x1BOx',
+                'KP_9':        b'\x1BOy',
+                'KP_Decimal':  b'\x1BOn',
+                'KP_Subtract': b'\x1BOm',
+                'KP_Enter':    b'\x1BOM',
+                'KP_Add':      b'+',
+                'KP_Multiply': b'*',
+                'KP_Divide':   b'/',
+            }
+
+            if self.term.vt100_application_keypad:
+                key_map.update(keypad_application)
+            else:
+                key_map.update(keypad_normal)
 
         if ks in key_map:
             self.telnet.send(key_map[ks])
