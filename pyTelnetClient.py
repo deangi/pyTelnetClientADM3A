@@ -160,7 +160,11 @@ class TerminalEmulator:
         self.active_charset = 0
         self.vt100_application_keypad = False
         self.vt100_cursor_key_application = False
-        self.vt100_auto_wrap = False
+        self.vt100_auto_wrap = True
+        self.vt100_origin_mode = False
+        self.vt100_pending_wrap = False
+        self.scroll_top = 0
+        self.scroll_bottom = self.ROWS - 1
         self.current_inverse = False
         self.dirty = True
 
@@ -171,6 +175,11 @@ class TerminalEmulator:
         if mode == self.MODE_VT100:
             self.vt100_application_keypad = False
             self.active_charset = 0
+            self.vt100_auto_wrap = True
+            self.vt100_origin_mode = False
+            self.vt100_pending_wrap = False
+            self.scroll_top = 0
+            self.scroll_bottom = self.ROWS - 1
 
     # ---- low-level buffer ops ---------------------------------------------
     def clear(self):
@@ -180,28 +189,63 @@ class TerminalEmulator:
                 self.inverse[r][c] = False
         self.cx = 0
         self.cy = 0
+        self.vt100_pending_wrap = False
         self.dirty = True
 
-    def scroll_up(self):
-        for r in range(self.ROWS - 1):
+    def scroll_up(self, top=None, bottom=None):
+        if top is None:
+            top = 0
+        if bottom is None:
+            bottom = self.ROWS - 1
+        top = max(0, min(self.ROWS - 1, top))
+        bottom = max(0, min(self.ROWS - 1, bottom))
+        if bottom <= top:
+            return
+
+        for r in range(top, bottom):
             self.buf[r] = self.buf[r + 1][:]
             self.inverse[r] = self.inverse[r + 1][:]
-        self.buf[self.ROWS - 1] = [' '] * self.COLS
-        self.inverse[self.ROWS - 1] = [False] * self.COLS
+        self.buf[bottom] = [' '] * self.COLS
+        self.inverse[bottom] = [False] * self.COLS
+        self.dirty = True
+
+    def scroll_down(self, top=None, bottom=None):
+        if top is None:
+            top = 0
+        if bottom is None:
+            bottom = self.ROWS - 1
+        top = max(0, min(self.ROWS - 1, top))
+        bottom = max(0, min(self.ROWS - 1, bottom))
+        if bottom <= top:
+            return
+
+        for r in range(bottom, top, -1):
+            self.buf[r] = self.buf[r - 1][:]
+            self.inverse[r] = self.inverse[r - 1][:]
+        self.buf[top] = [' '] * self.COLS
+        self.inverse[top] = [False] * self.COLS
         self.dirty = True
 
     def newline(self):
         self.cx = 0
-        if self.cy >= self.ROWS - 1:
-            self.scroll_up()
+        self.vt100_pending_wrap = False
+        if self.mode == self.MODE_VT100 and self.cy == self.scroll_bottom:
+            self.scroll_up(self.scroll_top, self.scroll_bottom)
+        elif self.cy >= self.ROWS - 1:
+            self.scroll_up(0, self.ROWS - 1)
         else:
             self.cy += 1
 
     def cursor_to(self, row, col):
-        row = max(0, min(self.ROWS - 1, row))
+        if self.mode == self.MODE_VT100 and self.vt100_origin_mode:
+            row += self.scroll_top
+            row = max(self.scroll_top, min(self.scroll_bottom, row))
+        else:
+            row = max(0, min(self.ROWS - 1, row))
         col = max(0, min(self.COLS - 1, col))
         self.cy = row
         self.cx = col
+        self.vt100_pending_wrap = False
 
     def erase_in_line(self, mode):
         # 0 = cursor..EOL, 1 = BOL..cursor, 2 = entire line
@@ -298,10 +342,12 @@ class TerminalEmulator:
             self.root_bell()
             return
         if b == 0x08:                                   # BS
+            self.vt100_pending_wrap = False
             if self.cx > 0:
                 self.cx -= 1
             return
         if b == 0x09:                                   # HT
+            self.vt100_pending_wrap = False
             self.cx = (self.cx + 8) & ~7
             if self.cx > self.COLS - 1:
                 self.cx = self.COLS - 1
@@ -311,6 +357,7 @@ class TerminalEmulator:
             return
         if b == 0x0D:                                   # CR
             self.cx = 0
+            self.vt100_pending_wrap = False
             return
         if b == 0x0E:                                   # SO — invoke G1
             if self.mode == self.MODE_VT100:
@@ -334,21 +381,28 @@ class TerminalEmulator:
         if b == 0x1E:                                   # RS — home (no clear)
             self.cx = 0
             self.cy = 0
+            self.vt100_pending_wrap = False
             return
 
         # Printable
         if 0x20 <= b < 0x7F:
+            if self.mode == self.MODE_VT100 and self.vt100_pending_wrap:
+                self.cx = 0
+                if self.cy == self.scroll_bottom:
+                    self.scroll_up(self.scroll_top, self.scroll_bottom)
+                elif self.cy >= self.ROWS - 1:
+                    self.scroll_up(0, self.ROWS - 1)
+                else:
+                    self.cy += 1
+                self.vt100_pending_wrap = False
+
             self.buf[self.cy][self.cx] = self.translate_printable(b)
             self.inverse[self.cy][self.cx] = self.current_inverse
             self.dirty = True
             if self.cx < self.COLS - 1:
                 self.cx += 1
             elif self.mode == self.MODE_VT100 and self.vt100_auto_wrap:
-                self.cx = 0
-                if self.cy >= self.ROWS - 1:
-                    self.scroll_up()
-                else:
-                    self.cy += 1
+                self.vt100_pending_wrap = True
             # else: stay clamped at COLS-1, matching CP/M-friendly behavior
 
     # ---- escape parsing ---------------------------------------------------
@@ -398,14 +452,18 @@ class TerminalEmulator:
             self.pstate = self.PS_GROUND
             return
         if b == ord('D'):                                # IND
-            if self.cy >= self.ROWS - 1:
-                self.scroll_up()
+            if self.mode == self.MODE_VT100 and self.cy == self.scroll_bottom:
+                self.scroll_up(self.scroll_top, self.scroll_bottom)
+            elif self.cy >= self.ROWS - 1:
+                self.scroll_up(0, self.ROWS - 1)
             else:
                 self.cy += 1
             self.pstate = self.PS_GROUND
             return
         if b == ord('M'):                                # RI (reverse index)
-            if self.cy > 0:
+            if self.mode == self.MODE_VT100 and self.cy == self.scroll_top:
+                self.scroll_down(self.scroll_top, self.scroll_bottom)
+            elif self.cy > 0:
                 self.cy -= 1
             self.pstate = self.PS_GROUND
             return
@@ -432,9 +490,6 @@ class TerminalEmulator:
             self.g0_charset = charset
         else:
             self.g1_charset = charset
-            # Some hosts designate G1 with ESC ) 0 / ESC ) B but omit SO/SI.
-            # Follow the designation so line drawing does not leak as qqq/x.
-            self.active_charset = 1 if charset == self.CHARSET_SPECIAL_GRAPHICS else 0
 
     def translate_printable(self, b):
         if self.mode != self.MODE_VT100:
@@ -516,7 +571,27 @@ class TerminalEmulator:
             self.cy = self.saved_cy
         elif final == ord('m'):                          # SGR
             self.dispatch_sgr()
+        elif final == ord('r'):                          # DECSTBM
+            self.set_scroll_region()
         # Other CSI (DSR, etc.) silently ignored.
+
+    def set_scroll_region(self):
+        top = self.params[0] if len(self.params) >= 1 and self.params[0] else 1
+        bottom = self.params[1] if len(self.params) >= 2 and self.params[1] else self.ROWS
+
+        top -= 1
+        bottom -= 1
+        if top < 0:
+            top = 0
+        if bottom >= self.ROWS:
+            bottom = self.ROWS - 1
+        if bottom <= top:
+            self.scroll_top = 0
+            self.scroll_bottom = self.ROWS - 1
+        else:
+            self.scroll_top = top
+            self.scroll_bottom = bottom
+        self.cursor_to(0, 0)
 
     def dispatch_sgr(self):
         params = self.params if self.params else [0]
@@ -541,6 +616,9 @@ class TerminalEmulator:
             elif mode == 8:                              # DECARM
                 # Repeat-key mode is owned by the local keyboard/OS.
                 pass
+            elif mode == 6:                              # DECOM
+                self.vt100_origin_mode = enabled
+                self.cursor_to(0, 0)
             elif mode == 25:                             # DECTCEM
                 # Cursor visibility is ignored; cursor stays visible.
                 pass
