@@ -4,7 +4,7 @@ The ADM-3A is emulation is needed for things like WordStar and other non-console
 Run from Anaconda prompt
 
 Dean Gienger, 13 May 2026
-Version 2.0, 24 June 2026
+Version 2.1, 5 August 2026
 
 Saved connections are stored in:
 %APPDATA%\pyTelnetClient\connections.json

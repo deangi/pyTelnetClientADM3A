@@ -7,7 +7,7 @@ Run:  python pyTelnetClient.py
 The escape-code semantics mirror the vZ80 console parser so the same
 mode switch ("vt100" | "adm3a") behaves identically on either end.
 
-Version 2.0, June 24, 2026
+Version 2.1, August 5, 2026
 Dean Gienger, May 13, 2026, with Claude
 """
 
@@ -20,8 +20,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, font, messagebox
 
-APP_VERSION = "2.0"
-APP_RELEASE_DATE = "June 24, 2026"
+APP_VERSION = "2.1"
+APP_RELEASE_DATE = "August 5, 2026"
 APP_CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "pyTelnetClient"
 CONNECTIONS_FILE = APP_CONFIG_DIR / "connections.json"
 
@@ -86,12 +86,13 @@ class ConnectionStore:
 
 
 # ---------------------------------------------------------------------------
-# Terminal emulator (parser + 80x24 buffer)
+# Terminal emulator (parser + 80x24 buffer + scrollback)
 # ---------------------------------------------------------------------------
 
 class TerminalEmulator:
     COLS = 80
     ROWS = 24
+    SCROLLBACK_MAX = 1000
 
     MODE_VT100 = 0
     MODE_ADM3A = 1
@@ -144,6 +145,9 @@ class TerminalEmulator:
     def __init__(self):
         self.buf = [[' '] * self.COLS for _ in range(self.ROWS)]
         self.inverse = [[False] * self.COLS for _ in range(self.ROWS)]
+        # Lines scrolled off the top of the screen (oldest first).
+        self.history = []  # list of (chars_row, inverse_row)
+        self.history_trimmed = 0  # rows dropped from front since last check
         self.cx = 0
         self.cy = 0
         self.saved_cx = 0
@@ -167,6 +171,7 @@ class TerminalEmulator:
         self.scroll_bottom = self.ROWS - 1
         self.current_inverse = False
         self.dirty = True
+        self.answerback = self.default_answerback
 
     # ---- mode --------------------------------------------------------------
     def set_mode(self, mode):
@@ -192,6 +197,33 @@ class TerminalEmulator:
         self.vt100_pending_wrap = False
         self.dirty = True
 
+    def _push_scrollback(self, chars, inv):
+        """Save a line scrolled off the absolute top of the screen."""
+        self.history.append((chars[:], inv[:]))
+        while len(self.history) > self.SCROLLBACK_MAX:
+            self.history.pop(0)
+            self.history_trimmed += 1
+
+    def take_history_trimmed(self):
+        n = self.history_trimmed
+        self.history_trimmed = 0
+        return n
+
+    def line_at(self, abs_row):
+        """Return (chars, inverse) for absolute row (0 = oldest scrollback)."""
+        hist = len(self.history)
+        if abs_row < 0:
+            return [' '] * self.COLS, [False] * self.COLS
+        if abs_row < hist:
+            return self.history[abs_row]
+        live = abs_row - hist
+        if 0 <= live < self.ROWS:
+            return self.buf[live], self.inverse[live]
+        return [' '] * self.COLS, [False] * self.COLS
+
+    def total_rows(self):
+        return len(self.history) + self.ROWS
+
     def scroll_up(self, top=None, bottom=None):
         if top is None:
             top = 0
@@ -201,6 +233,10 @@ class TerminalEmulator:
         bottom = max(0, min(self.ROWS - 1, bottom))
         if bottom <= top:
             return
+
+        # Lines leaving the absolute top of the screen enter scrollback.
+        if top == 0:
+            self._push_scrollback(self.buf[0], self.inverse[0])
 
         for r in range(top, bottom):
             self.buf[r] = self.buf[r + 1][:]
@@ -443,6 +479,10 @@ class TerminalEmulator:
             self.cur_param = ''
             self.csi_private = False
             return
+        if self.mode == self.MODE_VT100 and b == ord('Z'):  # DECID
+            self.answerback(b'\x1B[?1;2c')
+            self.pstate = self.PS_GROUND
+            return
         if b in (ord('('), ord(')')):
             self.charset_designate_target = 0 if b == ord('(') else 1
             self.pstate = self.PS_CHARSET_DESIGNATE
@@ -573,6 +613,9 @@ class TerminalEmulator:
             self.dispatch_sgr()
         elif final == ord('r'):                          # DECSTBM
             self.set_scroll_region()
+        elif final == ord('c'):                          # DA
+            if not self.params or self.params == [0]:
+                self.answerback(b'\x1B[?1;2c')
         # Other CSI (DSR, etc.) silently ignored.
 
     def set_scroll_region(self):
@@ -626,6 +669,9 @@ class TerminalEmulator:
 
     # ---- hooks (overridable) ----------------------------------------------
     def root_bell(self):
+        pass
+
+    def default_answerback(self, data):
         pass
 
 
@@ -792,6 +838,7 @@ class TerminalApp:
 
         self.term = TerminalEmulator()
         self.term.root_bell = self._bell
+        self.term.answerback = self._terminal_answerback
         self.rx_queue = queue.Queue()
         self.telnet = TelnetClient(self._on_rx_bytes, self._on_status,
                                    self._on_unexpected_disconnect)
@@ -801,6 +848,13 @@ class TerminalApp:
         self.reconnect_active = False
         self.reconnect_host = ""
         self.reconnect_port = 23
+        self.selection_start = None
+        self.selection_end = None
+        self.selection_dragging = False
+        # 0 = live screen; positive = lines scrolled up into history.
+        self.view_offset = 0
+        self.capture_active = False
+        self.capture_chunks = []
 
         self._build_ui()
         self._schedule_refresh()
@@ -846,9 +900,6 @@ class TerminalApp:
                                       command=self._on_connect)
         self.connect_btn.pack(side=tk.LEFT, padx=4)
 
-        ttk.Button(top, text="Clear", command=self._on_clear)\
-            .pack(side=tk.LEFT, padx=2)
-
         self.connection_state_var = tk.StringVar(value="Disconnected")
         self.connection_state_label = tk.Label(
             top, textvariable=self.connection_state_var,
@@ -876,11 +927,35 @@ class TerminalApp:
         self.fg = "#E6E6E6"
         self.bg = "#000000"
         self.cursor_color = "#33FF33"
+        self.selection_fg = "#FFFFFF"
+        self.selection_bg = "#2A62D5"
 
-        self.canvas = tk.Canvas(self.root, width=cw_total, height=ch_total,
+        terminal_area = ttk.Frame(self.root)
+        terminal_area.pack(padx=4, pady=4)
+
+        self.canvas = tk.Canvas(terminal_area, width=cw_total, height=ch_total,
                                 bg=self.bg, highlightthickness=0,
                                 takefocus=True)
-        self.canvas.pack(padx=4, pady=4)
+        self.canvas.pack(side=tk.LEFT)
+
+        self.scrollbar = ttk.Scrollbar(terminal_area, orient=tk.VERTICAL,
+                                       command=self._on_scrollbar)
+        self.scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+
+        side = ttk.Frame(terminal_area, padding=(8, 0, 0, 0))
+        side.pack(side=tk.LEFT, fill=tk.Y)
+
+        ttk.Button(side, text="Clear", command=self._on_clear)\
+            .pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(side, text="Copy",
+                   command=lambda: self._copy_selection(show_empty=True))\
+            .pack(fill=tk.X, pady=4)
+        ttk.Button(side, text="Paste", command=self._paste_clipboard)\
+            .pack(fill=tk.X, pady=4)
+        ttk.Button(side, text="Start Capture", command=self._start_capture)\
+            .pack(fill=tk.X, pady=4)
+        ttk.Button(side, text="Load Capture", command=self._load_capture)\
+            .pack(fill=tk.X, pady=4)
 
         # Pre-build cell background and text items — updating items is far
         # cheaper than redrawing the whole canvas each frame.
@@ -910,10 +985,21 @@ class TerminalApp:
         ttk.Label(self.root, textvariable=self.status_var, anchor=tk.W,
                   relief=tk.SUNKEN).pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Keyboard input
+        # Keyboard and mouse input
         self.canvas.bind("<Key>", self._on_key)
-        self.canvas.bind("<Button-1>", lambda e: self.canvas.focus_set())
+        self.canvas.bind("<Control-c>", self._on_copy_key)
+        self.canvas.bind("<Control-C>", self._on_copy_key)
+        self.canvas.bind("<Control-v>", self._on_paste_key)
+        self.canvas.bind("<Control-V>", self._on_paste_key)
+        self.canvas.bind("<Shift-Insert>", self._on_paste_key)
+        self.canvas.bind("<Button-1>", self._on_select_start)
+        self.canvas.bind("<B1-Motion>", self._on_select_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_select_end)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-4>", self._on_mousewheel_linux)
+        self.canvas.bind("<Button-5>", self._on_mousewheel_linux)
         self.canvas.focus_set()
+        self._sync_scrollbar()
 
     # ---- callbacks --------------------------------------------------------
     def _bell(self):
@@ -921,6 +1007,10 @@ class TerminalApp:
             self.root.bell()
         except Exception:
             pass
+
+    def _terminal_answerback(self, data):
+        if self.telnet.running:
+            self.telnet.send(data)
 
     def _on_mode_change(self, event=None):
         if self.mode_var.get() == "ADM-3A":
@@ -1171,11 +1261,138 @@ class TerminalApp:
             self._set_connection_state("Disconnected", "#7A1E1E")
 
     def _on_clear(self):
+        self._clear_selection()
+        self.view_offset = 0
         self.term.clear()
+        self._sync_scrollbar()
+
+    def _view_top(self):
+        """Absolute row index of the first visible screen row."""
+        return len(self.term.history) - self.view_offset
+
+    def _clamp_view_offset(self):
+        hist = len(self.term.history)
+        if self.view_offset > hist:
+            self.view_offset = hist
+        if self.view_offset < 0:
+            self.view_offset = 0
+
+    def _scroll_view(self, delta_lines):
+        """Move the viewport by delta_lines (positive = older / up)."""
+        if delta_lines == 0 and len(self.term.history) == 0:
+            return
+        self.view_offset += delta_lines
+        self._clamp_view_offset()
+        self._sync_scrollbar()
+        self._redraw()
+        self._update_cursor()
+
+    def _snap_to_live(self):
+        if self.view_offset != 0:
+            self.view_offset = 0
+            self._sync_scrollbar()
+            self._redraw()
+            self._update_cursor()
+
+    def _sync_scrollbar(self):
+        hist = len(self.term.history)
+        total = hist + TerminalEmulator.ROWS
+        if hist <= 0:
+            self.scrollbar.set(0.0, 1.0)
+            return
+        top = float(hist - self.view_offset) / float(total)
+        bottom = float(hist - self.view_offset + TerminalEmulator.ROWS) / float(total)
+        self.scrollbar.set(max(0.0, top), min(1.0, bottom))
+
+    def _on_scrollbar(self, action, value=None, units=None):
+        hist = len(self.term.history)
+        if hist <= 0:
+            self.view_offset = 0
+            self._sync_scrollbar()
+            return
+
+        if action == "moveto":
+            # value is fraction for the top of the thumb in the trough.
+            top_line = int(round(float(value) * hist))
+            top_line = max(0, min(hist, top_line))
+            self.view_offset = hist - top_line
+        elif action == "scroll":
+            amount = int(float(value))
+            if units == "pages":
+                amount *= TerminalEmulator.ROWS
+            self.view_offset -= amount  # scrollbar scroll down → newer
+            self._clamp_view_offset()
+        self._sync_scrollbar()
+        self._redraw()
+        self._update_cursor()
+
+    def _on_mousewheel(self, event):
+        # Windows/macOS: event.delta is multiples of 120.
+        if event.delta > 0:
+            self._scroll_view(3)
+        elif event.delta < 0:
+            self._scroll_view(-3)
+        return "break"
+
+    def _on_mousewheel_linux(self, event):
+        if event.num == 4:
+            self._scroll_view(3)
+        elif event.num == 5:
+            self._scroll_view(-3)
+        return "break"
+
+    def _adjust_selection_after_trim(self, dropped):
+        if dropped <= 0:
+            return
+        if self.selection_start is not None:
+            row, col = self.selection_start
+            row -= dropped
+            if row < 0:
+                self.selection_start = None
+                self.selection_end = None
+                self.selection_dragging = False
+                return
+            self.selection_start = (row, col)
+        if self.selection_end is not None:
+            row, col = self.selection_end
+            row -= dropped
+            if row < 0:
+                self.selection_start = None
+                self.selection_end = None
+                self.selection_dragging = False
+                return
+            self.selection_end = (row, col)
 
     def _on_rx_bytes(self, data):
         # Called from telnet rx thread — push to queue, drained on UI thread
         self.rx_queue.put(data)
+
+    def _capture_bytes(self, data):
+        if self.capture_active and data:
+            self.capture_chunks.append(data.decode('latin-1',
+                                                   errors='replace'))
+
+    def _start_capture(self):
+        self.capture_chunks = []
+        self.capture_active = True
+        self.status_var.set("Serial capture started")
+
+    def _captured_text(self):
+        return ''.join(self.capture_chunks)
+
+    def _load_capture(self):
+        self.capture_active = False
+        text = self._captured_text()
+        if not text:
+            self.status_var.set("No captured data")
+            return False
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self.status_var.set(f"Loaded {len(text)} captured characters")
+        self.canvas.focus_set()
+        return True
 
     def _on_status(self, text):
         # Marshal to UI thread
@@ -1188,6 +1405,140 @@ class TerminalApp:
     def _set_connection_state(self, text, bg):
         self.connection_state_var.set(text)
         self.connection_state_label.config(bg=bg)
+
+    def _event_to_cell(self, event):
+        """Map a canvas click to absolute (row, col) including scrollback."""
+        col = event.x // self.cell_w
+        row = event.y // self.cell_h
+        col = max(0, min(TerminalEmulator.COLS - 1, col))
+        row = max(0, min(TerminalEmulator.ROWS - 1, row))
+        abs_row = self._view_top() + row
+        abs_row = max(0, min(self.term.total_rows() - 1, abs_row))
+        return abs_row, col
+
+    def _selection_bounds(self):
+        if self.selection_start is None or self.selection_end is None:
+            return None
+
+        start = self.selection_start
+        end = self.selection_end
+        start_pos = start[0] * TerminalEmulator.COLS + start[1]
+        end_pos = end[0] * TerminalEmulator.COLS + end[1]
+        if start_pos <= end_pos:
+            return start, end
+        return end, start
+
+    def _cell_is_selected(self, abs_row, col):
+        bounds = self._selection_bounds()
+        if bounds is None:
+            return False
+
+        start, end = bounds
+        pos = abs_row * TerminalEmulator.COLS + col
+        start_pos = start[0] * TerminalEmulator.COLS + start[1]
+        end_pos = end[0] * TerminalEmulator.COLS + end[1]
+        return start_pos <= pos <= end_pos
+
+    def _clear_selection(self):
+        if self.selection_start is None and self.selection_end is None:
+            return
+        self.selection_start = None
+        self.selection_end = None
+        self.selection_dragging = False
+        self._redraw()
+
+    def _on_select_start(self, event):
+        self.canvas.focus_set()
+        cell = self._event_to_cell(event)
+        self.selection_start = cell
+        self.selection_end = cell
+        self.selection_dragging = True
+        self._redraw()
+        return "break"
+
+    def _on_select_drag(self, event):
+        if not self.selection_dragging:
+            return "break"
+        self.selection_end = self._event_to_cell(event)
+        self._redraw()
+        return "break"
+
+    def _on_select_end(self, event):
+        if self.selection_dragging:
+            self.selection_end = self._event_to_cell(event)
+            self.selection_dragging = False
+            self._redraw()
+        return "break"
+
+    def _selected_text(self):
+        bounds = self._selection_bounds()
+        if bounds is None:
+            return ""
+
+        start, end = bounds
+        lines = []
+        for row in range(start[0], end[0] + 1):
+            if row == start[0]:
+                col_start = start[1]
+            else:
+                col_start = 0
+
+            if row == end[0]:
+                col_end = end[1]
+            else:
+                col_end = TerminalEmulator.COLS - 1
+
+            chars, _inv = self.term.line_at(row)
+            text = ''.join(chars[col_start:col_end + 1])
+            lines.append(text.rstrip())
+        return "\r".join(lines)
+
+    def _copy_selection(self, show_empty=False):
+        text = self._selected_text()
+        if not text:
+            if show_empty:
+                self.status_var.set("No text selected")
+            return False
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self.status_var.set(f"Copied {len(text)} characters")
+        return True
+
+    def _on_copy_key(self, event):
+        if self._copy_selection():
+            return "break"
+        return None
+
+    def _clipboard_text_for_terminal(self, text):
+        text = text.replace("\r\n", "\n")
+        text = text.replace("\r", "\n")
+        return text.replace("\n", "\r")
+
+    def _paste_clipboard(self):
+        if not self.telnet.running:
+            self.status_var.set("Not connected")
+            return False
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            self.status_var.set("Clipboard is empty")
+            return False
+
+        data = self._clipboard_text_for_terminal(text)
+        if not data:
+            self.status_var.set("Clipboard is empty")
+            return False
+
+        self.telnet.send(data)
+        self.status_var.set(f"Pasted {len(data)} characters")
+        self.canvas.focus_set()
+        return True
+
+    def _on_paste_key(self, event):
+        self._paste_clipboard()
+        return "break"
 
     def _on_unexpected_disconnect(self):
         self.root.after(0, self._handle_unexpected_disconnect)
@@ -1245,12 +1596,19 @@ class TerminalApp:
         try:
             while True:
                 data = self.rx_queue.get_nowait()
+                self._capture_bytes(data)
                 self.term.write(data)
                 drained = True
         except queue.Empty:
             pass
 
-        if self.term.dirty or drained:
+        trimmed = self.term.take_history_trimmed()
+        if trimmed:
+            self._adjust_selection_after_trim(trimmed)
+            self._clamp_view_offset()
+
+        if self.term.dirty or drained or trimmed:
+            self._sync_scrollbar()
             self._redraw()
             self.term.dirty = False
 
@@ -1261,15 +1619,17 @@ class TerminalApp:
         cfg = self.canvas.itemconfig
         items = self.cell_items
         bg_items = self.cell_bg_items
-        buf = self.term.buf
-        inverse = self.term.inverse
+        view_top = self._view_top()
         for r in range(TerminalEmulator.ROWS):
-            row = buf[r]
-            inverse_row = inverse[r]
+            abs_row = view_top + r
+            row, inverse_row = self.term.line_at(abs_row)
             row_items = items[r]
             row_bg_items = bg_items[r]
             for c in range(TerminalEmulator.COLS):
-                if inverse_row[c]:
+                if self._cell_is_selected(abs_row, c):
+                    text_fill = self.selection_fg
+                    bg_fill = self.selection_bg
+                elif inverse_row[c]:
                     text_fill = self.bg
                     bg_fill = self.fg
                 else:
@@ -1279,8 +1639,16 @@ class TerminalApp:
                 cfg(row_items[c], text=row[c], fill=text_fill)
 
     def _update_cursor(self):
+        # Cursor tracks the live screen; hide it while viewing scrollback.
+        live_top = len(self.term.history)
+        view_top = self._view_top()
+        abs_cy = live_top + self.term.cy
+        if abs_cy < view_top or abs_cy >= view_top + TerminalEmulator.ROWS:
+            self.canvas.itemconfig(self.cursor_item, state="hidden")
+            return
+        self.canvas.itemconfig(self.cursor_item, state="normal")
         x = self.term.cx * self.cell_w
-        y = self.term.cy * self.cell_h
+        y = (abs_cy - view_top) * self.cell_h
         self.canvas.coords(self.cursor_item,
                            x, y, x + self.cell_w, y + self.cell_h)
 
@@ -1294,6 +1662,9 @@ class TerminalApp:
     def _on_key(self, event):
         if not self.telnet.running:
             return
+
+        # Typing returns the viewport to the live screen.
+        self._snap_to_live()
 
         ks = event.keysym
         ch = event.char
