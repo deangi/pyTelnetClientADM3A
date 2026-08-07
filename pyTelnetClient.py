@@ -7,7 +7,7 @@ Run:  python pyTelnetClient.py
 The escape-code semantics mirror the vZ80 console parser so the same
 mode switch ("vt100" | "adm3a") behaves identically on either end.
 
-Version 2.1, August 5, 2026
+Version 2.2, August 7, 2026
 Dean Gienger, May 13, 2026, with Claude
 """
 
@@ -20,8 +20,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, font, messagebox
 
-APP_VERSION = "2.1"
-APP_RELEASE_DATE = "August 5, 2026"
+APP_VERSION = "2.2"
+APP_RELEASE_DATE = "August 7, 2026"
 APP_CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "pyTelnetClient"
 CONNECTIONS_FILE = APP_CONFIG_DIR / "connections.json"
 
@@ -985,12 +985,11 @@ class TerminalApp:
         ttk.Label(self.root, textvariable=self.status_var, anchor=tk.W,
                   relief=tk.SUNKEN).pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Keyboard and mouse input
+        # Keyboard and mouse input.
+        # Ctrl+C / Ctrl+V are NOT intercepted — ASCII controls (0..127),
+        # including ^C, are sent to the host via <Key>. Use the Copy/Paste
+        # buttons or Shift+Insert (paste) for clipboard.
         self.canvas.bind("<Key>", self._on_key)
-        self.canvas.bind("<Control-c>", self._on_copy_key)
-        self.canvas.bind("<Control-C>", self._on_copy_key)
-        self.canvas.bind("<Control-v>", self._on_paste_key)
-        self.canvas.bind("<Control-V>", self._on_paste_key)
         self.canvas.bind("<Shift-Insert>", self._on_paste_key)
         self.canvas.bind("<Button-1>", self._on_select_start)
         self.canvas.bind("<B1-Motion>", self._on_select_drag)
@@ -1761,7 +1760,12 @@ class TerminalApp:
             self.telnet.send(key_map[ks])
             return
 
-        if ch:
+        # Pass through ASCII including C0 controls (e.g. Ctrl+C -> 0x03).
+        if ch and len(ch) == 1:
+            code = ord(ch)
+            if 0 <= code <= 127:
+                self.telnet.send(bytes([code]))
+                return
             try:
                 self.telnet.send(ch.encode('latin-1'))
             except UnicodeEncodeError:
