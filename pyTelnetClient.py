@@ -7,7 +7,7 @@ Run:  python pyTelnetClient.py
 The escape-code semantics mirror the vZ80 console parser so the same
 mode switch ("vt100" | "adm3a") behaves identically on either end.
 
-Version 2.2, August 7, 2026
+Version 2.4, September 5, 2026
 Dean Gienger, May 13, 2026, with Claude
 """
 
@@ -20,8 +20,13 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, font, messagebox
 
-APP_VERSION = "2.2"
-APP_RELEASE_DATE = "August 7, 2026"
+try:
+    import serial
+except ImportError:
+    serial = None
+
+APP_VERSION = "2.4"
+APP_RELEASE_DATE = "September 5, 2026"
 APP_CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "pyTelnetClient"
 CONNECTIONS_FILE = APP_CONFIG_DIR / "connections.json"
 
@@ -62,14 +67,23 @@ class ConnectionStore:
             return None
 
         name = str(item.get("name", "")).strip()
+        connection_type = str(item.get("type", "tcp")).strip().lower()
+        if connection_type not in ("tcp", "serial"):
+            connection_type = "tcp"
         host = str(item.get("host", "")).strip()
+        serial_port = str(item.get("serial_port", item.get("device", ""))).strip()
         mode = str(item.get("emulation", "VT-100")).strip().upper()
         try:
             port = int(item.get("port", 23))
         except (TypeError, ValueError):
             port = 23
+        try:
+            baudrate = int(item.get("baudrate", item.get("baud", 9600)))
+        except (TypeError, ValueError):
+            baudrate = 9600
 
-        if not name or not host:
+        if not name or (connection_type == "tcp" and not host) or (
+                connection_type == "serial" and not serial_port):
             return None
 
         if mode in ("ADM3A", "ADM-3A"):
@@ -79,8 +93,11 @@ class ConnectionStore:
 
         return {
             "name": name,
+            "type": connection_type,
             "host": host,
             "port": port,
+            "serial_port": serial_port,
+            "baudrate": baudrate,
             "emulation": emulation,
         }
 
@@ -185,6 +202,15 @@ class TerminalEmulator:
             self.vt100_pending_wrap = False
             self.scroll_top = 0
             self.scroll_bottom = self.ROWS - 1
+
+    def reset_stream_state(self):
+        """Discard an incomplete escape sequence after its input stream ends."""
+        self.pstate = self.PS_GROUND
+        self.params = []
+        self.cur_param = ''
+        self.csi_private = False
+        self.adm_cup_row = 0
+        self.charset_designate_target = 0
 
     # ---- low-level buffer ops ---------------------------------------------
     def clear(self):
@@ -695,11 +721,23 @@ class TelnetClient:
     def __init__(self, rx_callback, status_callback,
                  unexpected_disconnect_callback=None):
         self.sock = None
+        self.serial_conn = None
+        self.transport = None
         self.rx_callback = rx_callback
         self.status_callback = status_callback
         self.unexpected_disconnect_callback = unexpected_disconnect_callback
         self.rx_thread = None
         self.running = False
+
+    def _close_serial(self):
+        """Close a serial device defensively; USB devices may vanish at any time."""
+        connection = self.serial_conn
+        self.serial_conn = None
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
     def connect(self, host, port):
         if self.running:
@@ -707,6 +745,7 @@ class TelnetClient:
         try:
             self.sock = socket.create_connection((host, port), timeout=10)
             self.sock.settimeout(None)
+            self.transport = "tcp"
             self.running = True
             self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
             self.rx_thread.start()
@@ -715,6 +754,30 @@ class TelnetClient:
         except Exception as e:
             self.status_callback(f"Connect failed: {e}")
             self.sock = None
+            self.transport = None
+            return False
+
+    def connect_serial(self, serial_port, baudrate):
+        if self.running:
+            return False
+        if serial is None:
+            self.status_callback("Serial support requires pyserial (pip install pyserial)")
+            return False
+        try:
+            # Opening may fail because the device has de-enumerated.
+            self.serial_conn = serial.Serial(serial_port, baudrate, timeout=1)
+            self.transport = "serial"
+            self.running = True
+            self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+            self.rx_thread.start()
+            self.status_callback(f"Connected to {serial_port} at {baudrate} baud")
+            return True
+        except Exception as e:
+            # Also close a port successfully opened before a later setup error.
+            self._close_serial()
+            self.running = False
+            self.transport = None
+            self.status_callback(f"Serial connect failed: {e}")
             return False
 
     def disconnect(self, unexpected=False):
@@ -730,33 +793,57 @@ class TelnetClient:
             except Exception:
                 pass
             self.sock = None
+        self._close_serial()
+        self.transport = None
         if was_running:
             self.status_callback("Disconnected")
         if unexpected and self.unexpected_disconnect_callback is not None:
             self.unexpected_disconnect_callback()
 
     def send(self, data):
-        if self.sock is None or not self.running:
+        if not self.running or (self.sock is None and self.serial_conn is None):
             return
         if isinstance(data, str):
             data = data.encode('latin-1', errors='replace')
         try:
-            self.sock.sendall(data)
+            if self.transport == "serial":
+                # A USB serial device can disappear between the state check
+                # above and this write; this is deliberately inside try/except.
+                connection = self.serial_conn
+                if connection is None:
+                    raise OSError("serial device is unavailable")
+                connection.write(data)
+            else:
+                self.sock.sendall(data)
         except Exception as e:
             self.status_callback(f"Send error: {e}")
             self.disconnect(unexpected=True)
 
     def _rx_loop(self):
         iac_state = None
-        while self.running and self.sock is not None:
+        while self.running and (self.sock is not None or self.serial_conn is not None):
             try:
-                data = self.sock.recv(4096)
+                if self.transport == "serial":
+                    # Keep this call exception-contained: unplugging a device
+                    # while blocked in read is a normal reconnect condition.
+                    connection = self.serial_conn
+                    if connection is None:
+                        raise OSError("serial device is unavailable")
+                    data = connection.read(4096)
+                    if not data:
+                        continue
+                else:
+                    data = self.sock.recv(4096)
+                    if not data:
+                        break
             except Exception as e:
                 if self.running:
                     self.status_callback(f"Recv error: {e}")
                 break
-            if not data:
-                break
+
+            if self.transport == "serial":
+                self.rx_callback(data)
+                continue
 
             out = bytearray()
             for b in data:
@@ -799,8 +886,11 @@ class TelnetClient:
             except Exception:
                 pass
             self.sock = None
+        self._close_serial()
+        transport = self.transport
+        self.transport = None
         if unexpected:
-            self.status_callback("TCP disconnected")
+            self.status_callback("Serial disconnected" if transport == "serial" else "TCP disconnected")
             if self.unexpected_disconnect_callback is not None:
                 self.unexpected_disconnect_callback()
 
@@ -848,6 +938,9 @@ class TerminalApp:
         self.reconnect_active = False
         self.reconnect_host = ""
         self.reconnect_port = 23
+        self.reconnect_type = "tcp"
+        self.reconnect_serial_port = ""
+        self.reconnect_baudrate = 9600
         self.selection_start = None
         self.selection_end = None
         self.selection_dragging = False
@@ -855,6 +948,7 @@ class TerminalApp:
         self.view_offset = 0
         self.capture_active = False
         self.capture_chunks = []
+        self.status_escape_buffer = bytearray()
 
         self._build_ui()
         self._schedule_refresh()
@@ -877,24 +971,6 @@ class TerminalApp:
 
         ttk.Button(top, text="Manage", command=self._open_connection_manager)\
             .pack(side=tk.LEFT, padx=(2, 8))
-
-        ttk.Label(top, text="Host:").pack(side=tk.LEFT)
-        self.host_var = tk.StringVar(value="127.0.0.1")
-        ttk.Entry(top, textvariable=self.host_var, width=20)\
-            .pack(side=tk.LEFT, padx=2)
-
-        ttk.Label(top, text="Port:").pack(side=tk.LEFT)
-        self.port_var = tk.StringVar(value="23")
-        ttk.Entry(top, textvariable=self.port_var, width=6)\
-            .pack(side=tk.LEFT, padx=2)
-
-        ttk.Label(top, text="Mode:").pack(side=tk.LEFT, padx=(8, 0))
-        self.mode_var = tk.StringVar(value="VT-100")
-        mode_combo = ttk.Combobox(top, textvariable=self.mode_var,
-                                  values=["VT-100", "ADM-3A"],
-                                  width=8, state="readonly")
-        mode_combo.pack(side=tk.LEFT, padx=2)
-        mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
 
         self.connect_btn = ttk.Button(top, text="Connect",
                                       command=self._on_connect)
@@ -931,7 +1007,7 @@ class TerminalApp:
         self.selection_bg = "#2A62D5"
 
         terminal_area = ttk.Frame(self.root)
-        terminal_area.pack(padx=4, pady=4)
+        terminal_area.pack(anchor=tk.W, padx=4, pady=4)
 
         self.canvas = tk.Canvas(terminal_area, width=cw_total, height=ch_total,
                                 bg=self.bg, highlightthickness=0,
@@ -944,6 +1020,40 @@ class TerminalApp:
 
         side = ttk.Frame(terminal_area, padding=(8, 0, 0, 0))
         side.pack(side=tk.LEFT, fill=tk.Y)
+
+        ttk.Label(side, text="Type:").pack(anchor=tk.W)
+        self.connection_type_var = tk.StringVar(value="tcp")
+        ttk.Combobox(side, textvariable=self.connection_type_var,
+                     values=["tcp", "serial"], width=16,
+                     state="readonly").pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(side, text="Host:").pack(anchor=tk.W)
+        self.host_var = tk.StringVar(value="127.0.0.1")
+        ttk.Entry(side, textvariable=self.host_var, width=18)\
+            .pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(side, text="TCP port:").pack(anchor=tk.W)
+        self.port_var = tk.StringVar(value="23")
+        ttk.Entry(side, textvariable=self.port_var, width=18)\
+            .pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(side, text="COM port:").pack(anchor=tk.W)
+        self.serial_port_var = tk.StringVar()
+        ttk.Entry(side, textvariable=self.serial_port_var, width=18)\
+            .pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(side, text="Baud rate:").pack(anchor=tk.W)
+        self.baudrate_var = tk.StringVar(value="9600")
+        ttk.Entry(side, textvariable=self.baudrate_var, width=18)\
+            .pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(side, text="Emulation:").pack(anchor=tk.W)
+        self.mode_var = tk.StringVar(value="VT-100")
+        mode_combo = ttk.Combobox(side, textvariable=self.mode_var,
+                                  values=["VT-100", "ADM-3A"],
+                                  width=16, state="readonly")
+        mode_combo.pack(fill=tk.X, pady=(0, 8))
+        mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
 
         ttk.Button(side, text="Clear", command=self._on_clear)\
             .pack(fill=tk.X, pady=(0, 4))
@@ -979,6 +1089,22 @@ class TerminalApp:
         self.cursor_item = self.canvas.create_rectangle(
             0, 0, self.cell_w, self.cell_h,
             outline=self.cursor_color, width=1)
+
+        # The status panel is a borderless 80-column area aligned with the
+        # main terminal canvas; it does not extend beneath the right controls.
+        self.status_panel = tk.Text(self.root, height=4, width=TerminalEmulator.COLS,
+                                    font=self.mono, bg=self.bg, fg=self.fg,
+                                    insertbackground=self.fg, wrap=tk.NONE,
+                                    borderwidth=0, highlightthickness=0,
+                                    padx=0, pady=0, state=tk.DISABLED,
+                                    takefocus=False)
+        self.status_panel.pack(anchor=tk.W, padx=4, pady=(0, 4))
+        self.status_bg = self.bg
+        self.status_chars = [[' '] * TerminalEmulator.COLS for _ in range(4)]
+        self.status_fg = [[self.fg] * TerminalEmulator.COLS for _ in range(4)]
+        self.status_cell_bg = [[self.bg] * TerminalEmulator.COLS for _ in range(4)]
+        self.status_tags = {}
+        self._redraw_status_panel()
 
         # Status bar
         self.status_var = tk.StringVar(value="Not connected")
@@ -1030,8 +1156,11 @@ class TerminalApp:
         if conn is None:
             return
 
+        self.connection_type_var.set(conn["type"])
         self.host_var.set(conn["host"])
         self.port_var.set(str(conn["port"]))
+        self.serial_port_var.set(conn["serial_port"])
+        self.baudrate_var.set(str(conn["baudrate"]))
         self.mode_var.set(conn["emulation"])
         self._on_mode_change()
 
@@ -1051,13 +1180,15 @@ class TerminalApp:
         outer = ttk.Frame(win, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        tree = ttk.Treeview(outer, columns=("host", "port", "emulation"),
+        tree = ttk.Treeview(outer, columns=("type", "host", "port", "emulation"),
                             show="tree headings", height=8)
         tree.heading("#0", text="Name")
-        tree.heading("host", text="IP / Host")
+        tree.heading("type", text="Type")
+        tree.heading("host", text="Endpoint")
         tree.heading("port", text="Port")
         tree.heading("emulation", text="Emulation")
         tree.column("#0", width=130, stretch=False)
+        tree.column("type", width=60, anchor=tk.CENTER, stretch=False)
         tree.column("host", width=150, stretch=False)
         tree.column("port", width=60, anchor=tk.CENTER, stretch=False)
         tree.column("emulation", width=80, anchor=tk.CENTER, stretch=False)
@@ -1071,23 +1202,34 @@ class TerminalApp:
         ttk.Entry(form, textvariable=name_var, width=22)\
             .grid(row=0, column=1, padx=(2, 10), sticky=tk.W)
 
-        ttk.Label(form, text="IP / Host:").grid(row=0, column=2, sticky=tk.W)
+        ttk.Label(form, text="Type:").grid(row=0, column=2, sticky=tk.W)
+        type_var = tk.StringVar(value="tcp")
+        ttk.Combobox(form, textvariable=type_var, values=["tcp", "serial"],
+                     width=10, state="readonly").grid(row=0, column=3, padx=(2, 0), sticky=tk.W)
+
+        ttk.Label(form, text="IP / Host:").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
         host_var = tk.StringVar()
         ttk.Entry(form, textvariable=host_var, width=24)\
-            .grid(row=0, column=3, padx=(2, 0), sticky=tk.W)
+            .grid(row=1, column=1, padx=(2, 10), pady=(6, 0), sticky=tk.W)
 
-        ttk.Label(form, text="Port:").grid(row=1, column=0, sticky=tk.W,
+        ttk.Label(form, text="Port:").grid(row=1, column=2, sticky=tk.W,
                                            pady=(6, 0))
         port_var = tk.StringVar(value="23")
         ttk.Entry(form, textvariable=port_var, width=8)\
-            .grid(row=1, column=1, padx=(2, 10), pady=(6, 0), sticky=tk.W)
+            .grid(row=1, column=3, padx=(2, 0), pady=(6, 0), sticky=tk.W)
 
-        ttk.Label(form, text="Emulation:").grid(row=1, column=2, sticky=tk.W,
-                                                pady=(6, 0))
+        ttk.Label(form, text="COM port:").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+        serial_port_var = tk.StringVar()
+        ttk.Entry(form, textvariable=serial_port_var, width=12).grid(row=2, column=1, padx=(2, 10), pady=(6, 0), sticky=tk.W)
+        ttk.Label(form, text="Baud:").grid(row=2, column=2, sticky=tk.W, pady=(6, 0))
+        baudrate_var = tk.StringVar(value="9600")
+        ttk.Entry(form, textvariable=baudrate_var, width=10).grid(row=2, column=3, padx=(2, 0), pady=(6, 0), sticky=tk.W)
+
+        ttk.Label(form, text="Emulation:").grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
         emulation_var = tk.StringVar(value="VT-100")
         ttk.Combobox(form, textvariable=emulation_var, values=EMULATION_TYPES,
                      width=10, state="readonly")\
-            .grid(row=1, column=3, padx=(2, 0), pady=(6, 0), sticky=tk.W)
+            .grid(row=3, column=1, padx=(2, 0), pady=(6, 0), sticky=tk.W)
 
         buttons = ttk.Frame(outer)
         buttons.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
@@ -1098,9 +1240,10 @@ class TerminalApp:
             selected_id = None
             for index, conn in enumerate(self.connections):
                 item_id = str(index)
+                endpoint = conn["serial_port"] if conn["type"] == "serial" else conn["host"]
+                detail = conn["baudrate"] if conn["type"] == "serial" else conn["port"]
                 tree.insert("", tk.END, iid=item_id, text=conn["name"],
-                            values=(conn["host"], conn["port"],
-                                    conn["emulation"]))
+                            values=(conn["type"], endpoint, detail, conn["emulation"]))
                 if conn["name"] == select_name:
                     selected_id = item_id
             if selected_id is not None:
@@ -1122,33 +1265,37 @@ class TerminalApp:
                 return
             conn = self.connections[index]
             name_var.set(conn["name"])
+            type_var.set(conn["type"])
             host_var.set(conn["host"])
             port_var.set(str(conn["port"]))
+            serial_port_var.set(conn["serial_port"])
+            baudrate_var.set(str(conn["baudrate"]))
             emulation_var.set(conn["emulation"])
 
         def read_form(existing_index=None):
             name = name_var.get().strip()
+            connection_type = type_var.get()
             host = host_var.get().strip()
+            serial_port = serial_port_var.get().strip()
             emulation = emulation_var.get()
 
             if not name:
-                messagebox.showerror("Connection", "Enter a connection name.",
-                                     parent=win)
+                messagebox.showerror("Connection", "Enter a connection name.", parent=win)
                 return None
-            if not host:
-                messagebox.showerror("Connection", "Enter an IP or host.",
-                                     parent=win)
+            if connection_type == "tcp" and not host:
+                messagebox.showerror("Connection", "Enter an IP or host.", parent=win)
+                return None
+            if connection_type == "serial" and not serial_port:
+                messagebox.showerror("Connection", "Enter a COM port.", parent=win)
                 return None
             try:
                 port = int(port_var.get())
+                baudrate = int(baudrate_var.get())
             except ValueError:
-                messagebox.showerror("Connection", "Enter a numeric port.",
-                                     parent=win)
+                messagebox.showerror("Connection", "Port and baud rate must be numeric.", parent=win)
                 return None
-            if port < 1 or port > 65535:
-                messagebox.showerror("Connection",
-                                     "Port must be between 1 and 65535.",
-                                     parent=win)
+            if port < 1 or port > 65535 or baudrate < 1:
+                messagebox.showerror("Connection", "Enter valid port and baud-rate values.", parent=win)
                 return None
             if emulation not in EMULATION_TYPES:
                 emulation = "VT-100"
@@ -1162,8 +1309,11 @@ class TerminalApp:
 
             return {
                 "name": name,
+                "type": connection_type,
                 "host": host,
                 "port": port,
+                "serial_port": serial_port,
+                "baudrate": baudrate,
                 "emulation": emulation,
             }
 
@@ -1238,21 +1388,32 @@ class TerminalApp:
             self.connect_btn.config(text="Connect")
             self._set_connection_state("Disconnected", "#7A1E1E")
             return
+        connection_type = self.connection_type_var.get()
         try:
             port = int(self.port_var.get())
+            baudrate = int(self.baudrate_var.get())
         except ValueError:
-            self.status_var.set("Invalid port")
+            self.status_var.set("Invalid port or baud rate")
             return
         self._on_mode_change()
         host = self.host_var.get().strip()
-        if not host:
+        serial_port = self.serial_port_var.get().strip()
+        if connection_type == "tcp" and not host:
             self.status_var.set("Enter a host")
             return
+        if connection_type == "serial" and not serial_port:
+            self.status_var.set("Enter a COM port")
+            return
         self._cancel_reconnect()
+        self.reconnect_type = connection_type
         self.reconnect_host = host
         self.reconnect_port = port
+        self.reconnect_serial_port = serial_port
+        self.reconnect_baudrate = baudrate
         self._set_connection_state("Connecting", "#7A5A1E")
-        if self.telnet.connect(host, port):
+        connected = (self.telnet.connect_serial(serial_port, baudrate)
+                     if connection_type == "serial" else self.telnet.connect(host, port))
+        if connected:
             self.connect_btn.config(text="Disconnect")
             self._set_connection_state("Connected", "#1E6B35")
             self.canvas.focus_set()
@@ -1370,6 +1531,109 @@ class TerminalApp:
         if self.capture_active and data:
             self.capture_chunks.append(data.decode('latin-1',
                                                    errors='replace'))
+
+    @staticmethod
+    def _rgb_to_tk(value):
+        """Convert RGB nibbles to #R0G0B0 (for example, F12 -> #F01020)."""
+        value = value.upper()
+        return "#" + "".join(ch + "0" for ch in value)
+
+    def _set_status_background(self, rgb):
+        if len(rgb) != 3 or any(ch not in "0123456789abcdefABCDEF" for ch in rgb):
+            return False
+        self.status_bg = self._rgb_to_tk(rgb)
+        self.status_panel.config(bg=self.status_bg)
+        # A new panel background starts a fresh status display.
+        for row in range(4):
+            for col in range(TerminalEmulator.COLS):
+                self.status_chars[row][col] = ' '
+                self.status_fg[row][col] = self.fg
+                self.status_cell_bg[row][col] = self.status_bg
+        self._redraw_status_panel()
+        return True
+
+    def _write_status_text(self, fg_rgb, bg_rgb, row_text, col_text, text):
+        try:
+            row = int(row_text)
+            col = int(col_text)
+        except ValueError:
+            return False
+        if (len(fg_rgb) != 3 or len(bg_rgb) != 3 or row not in range(4)
+                or col not in range(TerminalEmulator.COLS)
+                or any(ch not in "0123456789abcdefABCDEF" for ch in fg_rgb + bg_rgb)):
+            return False
+        fg = self._rgb_to_tk(fg_rgb)
+        bg = self._rgb_to_tk(bg_rgb)
+        for ch in text:
+            if col >= TerminalEmulator.COLS:
+                break
+            self.status_chars[row][col] = ch
+            self.status_fg[row][col] = fg
+            self.status_cell_bg[row][col] = bg
+            col += 1
+        self._redraw_status_panel()
+        return True
+
+    def _redraw_status_panel(self):
+        self.status_panel.config(state=tk.NORMAL, bg=self.status_bg)
+        self.status_panel.delete("1.0", tk.END)
+        for row in range(4):
+            for col in range(TerminalEmulator.COLS):
+                fg = self.status_fg[row][col]
+                bg = self.status_cell_bg[row][col]
+                tag = self.status_tags.get((fg, bg))
+                if tag is None:
+                    tag = f"status_{len(self.status_tags)}"
+                    self.status_tags[(fg, bg)] = tag
+                    self.status_panel.tag_configure(tag, foreground=fg, background=bg)
+                self.status_panel.insert(tk.END, self.status_chars[row][col], tag)
+            if row < 3:
+                self.status_panel.insert(tk.END, "\n")
+        self.status_panel.config(state=tk.DISABLED)
+
+    def _filter_status_escapes(self, data):
+        """Apply complete ESC ** status commands and return terminal bytes."""
+        self.status_escape_buffer.extend(data)
+        output = bytearray()
+        while self.status_escape_buffer:
+            marker = self.status_escape_buffer.find(b"\x1b**")
+            if marker < 0:
+                # Keep a possible partial prefix for the next receive chunk.
+                keep = 0
+                for suffix in (b"\x1b**", b"\x1b*", b"\x1b"):
+                    if self.status_escape_buffer.endswith(suffix):
+                        keep = len(suffix)
+                        break
+                if keep:
+                    output.extend(self.status_escape_buffer[:-keep])
+                    self.status_escape_buffer = self.status_escape_buffer[-keep:]
+                else:
+                    output.extend(self.status_escape_buffer)
+                    self.status_escape_buffer.clear()
+                break
+            output.extend(self.status_escape_buffer[:marker])
+            command = self.status_escape_buffer[marker:]
+            if command.startswith(b"\x1b**BG"):
+                if len(command) < 8:
+                    self.status_escape_buffer = bytearray(command)
+                    break
+                code = command[5:8].decode("ascii", errors="ignore")
+                self._set_status_background(code)
+                self.status_escape_buffer = bytearray(command[8:])
+            elif command.startswith(b"\x1b**TX"):
+                eot = command.find(b"\x04", 5)
+                if eot < 0:
+                    self.status_escape_buffer = bytearray(command)
+                    break
+                fields = command[5:eot].decode("latin-1", errors="replace").split(",", 4)
+                if len(fields) == 5:
+                    self._write_status_text(*fields)
+                self.status_escape_buffer = bytearray(command[eot + 1:])
+            else:
+                # Not a status command: preserve the original terminal input.
+                output.append(self.status_escape_buffer[0])
+                self.status_escape_buffer = self.status_escape_buffer[1:]
+        return bytes(output)
 
     def _start_capture(self):
         self.capture_chunks = []
@@ -1542,7 +1806,13 @@ class TerminalApp:
     def _on_unexpected_disconnect(self):
         self.root.after(0, self._handle_unexpected_disconnect)
 
+    def _reset_stream_parsers(self):
+        # A lost TCP or serial stream can leave either parser mid-command.
+        self.status_escape_buffer.clear()
+        self.term.reset_stream_state()
+
     def _handle_unexpected_disconnect(self):
+        self._reset_stream_parsers()
         self.connect_btn.config(text="Connect")
         self._set_connection_state("Disconnected - retrying", "#7A1E1E")
         self.reconnect_active = True
@@ -1559,16 +1829,21 @@ class TerminalApp:
         self.reconnect_after_id = None
         if not self.reconnect_active or self.telnet.running:
             return
-        if not self.reconnect_host:
+        if (self.reconnect_type == "tcp" and not self.reconnect_host) or (self.reconnect_type == "serial" and not self.reconnect_serial_port):
             self._set_connection_state("Disconnected", "#7A1E1E")
             self.reconnect_active = False
             return
 
         self._set_connection_state("Reconnecting", "#7A5A1E")
-        self.status_var.set(
-            f"Reconnecting to {self.reconnect_host}:{self.reconnect_port}")
+        endpoint = (f"{self.reconnect_serial_port} at {self.reconnect_baudrate} baud"
+                    if self.reconnect_type == "serial"
+                    else f"{self.reconnect_host}:{self.reconnect_port}")
+        self.status_var.set(f"Reconnecting to {endpoint}")
         self._on_mode_change()
-        if self.telnet.connect(self.reconnect_host, self.reconnect_port):
+        connected = (self.telnet.connect_serial(self.reconnect_serial_port, self.reconnect_baudrate)
+                     if self.reconnect_type == "serial"
+                     else self.telnet.connect(self.reconnect_host, self.reconnect_port))
+        if connected:
             self.reconnect_active = False
             self.connect_btn.config(text="Disconnect")
             self._set_connection_state("Connected", "#1E6B35")
@@ -1596,7 +1871,9 @@ class TerminalApp:
             while True:
                 data = self.rx_queue.get_nowait()
                 self._capture_bytes(data)
-                self.term.write(data)
+                terminal_data = self._filter_status_escapes(data)
+                if terminal_data:
+                    self.term.write(terminal_data)
                 drained = True
         except queue.Empty:
             pass
